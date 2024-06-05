@@ -1,0 +1,413 @@
+---
+title: "Analiza saobraćajnih nesreća u Njujorku"
+author: "Anja Delić"
+date: "jun 2024."
+output: html_document
+---
+
+# Uvod
+
+Ovaj izveštaj pruža uvid u sve važne detalje toka analize saobraćajnih nesreća u Njujorku. Podaci, koji su preuzeti sa sajta: <https://data.cityofnewyork.us/Public-Safety/Motor-Vehicle-Collisions-Crashes/h9gi-nx95/about_data>, prikupljani su u rasponu od 2012. do 2024. godine. Izveštaj se sastoji od opisa korišćenog skupa podataka, kao i od prikaza analize, klasifikacije i klasterizacije izvrešene nad skupom podataka.
+
+## Izgled skupa podataka
+
+Skup podataka sastoji se od 29 obeležja i 2 091 223 jedinstvenih uzoraka. Obeležja su:
+
+-   **CRASH DATE**: Datum nastanka sudara.
+-   **CRASH TIME**: Vreme nastanka sudara.
+-   **BOROUGH**: Grad u kome se sudar dogodio.
+-   **ZIP CODE**: Poštanski broj mesta gde se incident dogodio.
+-   **LATITUDE**: Geografska širina u decimalnom formatu (EPSG 4326).
+-   **LONGITUDE**: Geografska dužina u decimalnom formatu (EPSG 4326).
+-   **LOCATION**: Par koordinata latitude i longitude.
+-   **ON STREET NAME**: Naziv ulice na kojoj se sudar dogodio.
+-   **CROSS STREET NAME**: Najbliža raskrsnica sudaru.
+-   **OFF STREET NAME**: Adresa ulice ako je poznata.
+-   **NUMBER OF PERSONS INJURED**: Broj povređenih osoba.
+-   **NUMBER OF PERSONS KILLED**: Broj poginulih osoba.
+-   **NUMBER OF PEDESTRIANS INJURED**: Broj povređenih pešaka.
+-   **NUMBER OF PEDESTRIANS KILLED**: Broj poginulih pešaka.
+-   **NUMBER OF CYCLIST INJURED**: Broj povređenih biciklista.
+-   **NUMBER OF CYCLIST KILLED**: Broj poginulih biciklista.
+-   **NUMBER OF MOTORIST INJURED**: Broj povređenih vozača.
+-   **NUMBER OF MOTORIST KILLED**: Broj poginulih vozača.
+-   **CONTRIBUTING FACTOR VEHICLE 1**: Faktori koji su doprineli sudaru za određeno vozilo.
+-   **CONTRIBUTING FACTOR VEHICLE 2**: Faktori koji su doprineli sudaru za određeno vozilo.
+-   **CONTRIBUTING FACTOR VEHICLE 3**: Faktori koji su doprineli sudaru za određeno vozilo.
+-   **CONTRIBUTING FACTOR VEHICLE 4**: Faktori koji su doprineli sudaru za određeno vozilo.
+-   **CONTRIBUTING FACTOR VEHICLE 5**: Faktori koji su doprineli sudaru za određeno vozilo.
+-   **COLLISION_ID**: Jedinstveni identifikacioni kod generisan od strane sistema. Primarni ključ za tabelu sudara.
+-   **VEHICLE TYPE CODE 1**: Tip vozila na osnovu odabrane kategorije vozila.
+-   **VEHICLE TYPE CODE 2**: Tip vozila na osnovu odabrane kategorije vozila.
+-   **VEHICLE TYPE CODE 3**: Tip vozila na osnovu odabrane kategorije vozila.
+-   **VEHICLE TYPE CODE 4**: Tip vozila na osnovu odabrane kategorije vozila.
+-   **VEHICLE TYPE CODE 5**: Tip vozila na osnovu odabrane kategorije vozila.
+
+## Inicijalna podešavanja
+
+```{r instalacija, eval=FALSE, include=TRUE}
+Sys.setenv(JAVA_HOME = "/Library/Java/JavaVirtualMachines/adoptopenjdk-8.jdk/Contents/Home")
+
+install.packages("sparklyr")
+install.packages("dplyr")
+install.packages("tidyr")
+install.packages("ggplot2")
+install.packages("knitr")
+install.packages("leaflet")
+install.packages("leaflet.extras")
+install.packages("glmnet")
+install.packages("caret")
+install.packages("e1071")
+install.packages("pROC")
+install.packages("ROCR")
+install.packages("reshape2")
+library(sparklyr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(leaflet)
+library(leaflet.extras)
+library(caret)
+library(e1071)
+library(pROC)
+library(ROCR)
+library(reshape2)
+library(glmnet)
+```
+
+#### Podešavanje spark sesije
+
+```{r eval=T, echo=F, results='hide', include=FALSE}
+spark_install("3.0") 
+conf <- spark_config() 
+conf$`sparklyr.shell.driver-memory` <- "16G" 
+conf$spark.memory.fraction <- 0.9
+
+sc <- spark_connect(master = "local",version = "3.0", config = conf)
+```
+
+#### Definisanje putanje do skupa podataka i učitavanje skupa podataka
+
+```{r eval=T, echo=F, results='hide', include=FALSE}
+file_path <- "Downloads/Motor_Vehicle_Collisions_-_Crashes.csv"
+
+  #Read dataset
+  collisions.basic <- spark_read_csv(sc, 
+                                     name = "Motor_Vehicle_Collisions_Crashes", 
+                                     path = file_path, 
+                                     header = TRUE, 
+                                     memory = TRUE)
+```
+
+## Opis skupa podataka
+
+#### Prikaz prvih 15 uzoraka iz skupa podataka
+
+```{r eval=T, results='hold'}
+  head_data <- collisions.basic %>% head(15) %>% collect()
+  print(head_data)
+```
+
+#### Prikaz broja uzoraka (redova) i obeležja (kolona) skupa podataka
+
+```{r eval=T, results='hold'}
+
+  num_rows <- sdf_nrow(collisions.basic)
+  print(paste("Number of samples:", num_rows))
+
+  num_cols <- length(sdf_schema(collisions.basic))
+  print(paste("Number of features:", num_cols))
+```
+
+#### Provera postojanja duplih vrednosti obeležja i uzoraka
+
+```{r eval=T, results='hold'}
+ column_names <- colnames(collisions.basic)
+ duplicated_columns <- column_names[duplicated(column_names)]
+ if (length(duplicated_columns) > 0) {
+   print("Duplicated columns found:")
+   print(duplicated_columns)
+ } else {
+   print("No duplicated columns found.")
+ }
+
+
+ duplicated_rows_count <- collisions.basic %>%
+   group_by_all() %>%
+   filter(n() > 1) %>%
+   summarise(count = n(), .groups = 'drop') %>%
+   collect() %>%
+   nrow()
+
+ if (duplicated_rows_count > 0) {
+   print(paste("Number of duplicated rows:", duplicated_rows_count))
+ } else {
+   print("No duplicated rows found.")
+ }
+```
+
+## Obrada nedostajućih vrednosti
+
+#### Funkcija za proveru nedostajućih vrednosti
+
+```{r eval=T, results='hold'}
+calculate_na_percentage <- function(df) {
+  num_rows <- sdf_nrow(df)
+  
+  na_percentages <- df %>%
+    # ~ must be used to introduce annonymous function inside summarise_all function
+    summarise_all(~(sum(ifelse(is.na(.), 1, 0)) / num_rows) * 100) %>%
+    collect() %>%
+    #converts to longer format for better readability
+    pivot_longer(cols = everything(), names_to = "Column", values_to = "NA_Percentage")
+  return(na_percentages)
+}
+
+```
+
+#### Izbacivanje i zamena nedostajućih vrednosti
+
+Ukoliko je ID nedostajuća vrednost izbaci taj red iz skupa podataka
+
+```{r eval=T, results='hold'}
+na_percentages <- calculate_na_percentage(collisions.basic)
+print("Percentage of NaN values in each column:")
+print(n=29,na_percentages)
+```
+
+Kako bi se što manje podataka izgubilo određena obeležja se zamenjuju odgovarajućim vrednostima. Ovo je moguće jer na primer obeležje 'CONTRIBUTING_FACTOR_VEHICLE_4' može biti nedostajuće jer u sudaru nisu učestvovala četiri vozila, a slično važi i za ostala obeležja.
+
+```{r eval=T, results='hold'}
+collisions <- collisions.basic %>%
+  mutate(
+    CONTRIBUTING_FACTOR_VEHICLE_2 = ifelse(is.na(CONTRIBUTING_FACTOR_VEHICLE_2), "Unspecified", CONTRIBUTING_FACTOR_VEHICLE_2),
+    CONTRIBUTING_FACTOR_VEHICLE_3 = ifelse(is.na(CONTRIBUTING_FACTOR_VEHICLE_3), "Unspecified", CONTRIBUTING_FACTOR_VEHICLE_3),
+    CONTRIBUTING_FACTOR_VEHICLE_4 = ifelse(is.na(CONTRIBUTING_FACTOR_VEHICLE_4), "Unspecified", CONTRIBUTING_FACTOR_VEHICLE_4),
+    CONTRIBUTING_FACTOR_VEHICLE_5 = ifelse(is.na(CONTRIBUTING_FACTOR_VEHICLE_5), "Unspecified", CONTRIBUTING_FACTOR_VEHICLE_5)
+  )
+
+  collisions <- collisions %>%
+    mutate(
+      VEHICLE_TYPE_CODE_2 = ifelse(is.na(VEHICLE_TYPE_CODE_2) , "UNKNOWN", VEHICLE_TYPE_CODE_2),
+      VEHICLE_TYPE_CODE_3 = ifelse(is.na(VEHICLE_TYPE_CODE_3), "UNKNOWN", VEHICLE_TYPE_CODE_3),
+      VEHICLE_TYPE_CODE_4 = ifelse(is.na(VEHICLE_TYPE_CODE_4) , "UNKNOWN", VEHICLE_TYPE_CODE_4),
+      VEHICLE_TYPE_CODE_5 = ifelse(is.na(VEHICLE_TYPE_CODE_5) , "UNKNOWN", VEHICLE_TYPE_CODE_5)
+    )
+  
+  collisions <- collisions %>%
+    mutate(
+      CROSS_STREET_NAME = ifelse(is.na(CROSS_STREET_NAME), "Unknown", CROSS_STREET_NAME),
+      OFF_STREET_NAME = ifelse(is.na(OFF_STREET_NAME) || OFF_STREET_NAME=="", "Not provided", OFF_STREET_NAME)
+    )
+```
+
+Izbacivanje preostalih redova sa nedostajućim vrednostima i provera broja preostalih redova.
+
+```{r eval=T, results='hold'}
+ collisions <- collisions %>%
+    filter(!is.na(CONTRIBUTING_FACTOR_VEHICLE_1) &
+             !is.na(LATITUDE) &
+             !is.na(LONGITUDE) &
+             !is.na(BOROUGH) &
+             !is.na(ZIP_CODE) &
+             !is.na(ON_STREET_NAME) &
+             !is.na(VEHICLE_TYPE_CODE_1) &
+             !is.na(VEHICLE_TYPE_CODE_2) &
+             !is.na(VEHICLE_TYPE_CODE_3) &
+             !is.na(VEHICLE_TYPE_CODE_4) &
+             !is.na(VEHICLE_TYPE_CODE_5) &
+             !is.na(NUMBER_OF_PERSONS_INJURED) &
+             !is.na(NUMBER_OF_PERSONS_KILLED) )
+  
+
+
+  # Get the number of rows
+  num_rows <- sdf_nrow(collisions)
+  print(paste("Number of samples:", num_rows))
+
+```
+
+## Povećavanje skupa podataka
+
+```{r eval=T, results='hold'}
+
+for(i in 1:2){    
+collisions.basic <- sdf_bind_rows(collisions.basic, collisions.basic)   
+num_rows_after_duplication <- sdf_nrow(collisions.basic)        
+print(paste("Number of samples after duplication:", num_rows_after_duplication))
+}
+```
+
+# Analiza obeležja
+
+U ovom delu izveštaja fokus je prvenstveno stavljen na analizu pojedinačnih obeležja, a potom i na odnose među njima.
+
+## Deskriptivne statistike
+
+Prvo se obeležja koja imaju numeričke vrednosti izdvoje u vektor 'categorical_cols', a potom se za svaku od odabranih kolona računa i ispisuje broj pojavljivanja određenih kategorijskih vrednosti sortiran opadajuće.
+
+```{r eval=T, results='hold'}
+
+  categorical_cols <- c("BOROUGH", "CONTRIBUTING_FACTOR_VEHICLE_1", "CONTRIBUTING_FACTOR_VEHICLE_2", "CONTRIBUTING_FACTOR_VEHICLE_3","CONTRIBUTING_FACTOR_VEHICLE_4","CONTRIBUTING_FACTOR_VEHICLE_5","VEHICLE_TYPE_CODE_1", "VEHICLE_TYPE_CODE_2","VEHICLE_TYPE_CODE_3","VEHICLE_TYPE_CODE_4", "VEHICLE_TYPE_CODE_5","ON_STREET_NAME","CROSS_STREET_NAME","OFF_STREET_NAME")
+  
+frequency_table <- vector("list", length(categorical_cols))
+  for (i in seq_along(categorical_cols)) {
+    col <- categorical_cols[i]
+    freq_table <- collisions %>%
+      group_by(!!sym(col)) %>%
+      summarise(count = n()) %>%
+      collect() %>%
+      arrange(desc(count))
+    frequency_table[[i]] <- freq_table
+  }
+
+  names(frequency_table) <- categorical_cols
+  print("Frequency Tables:")
+  print(frequency_table)
+```
+
+Potom se obeležja koja imaju numeričke vrednosti, a koji su u skupu podataka su prepoznati kao karakteri, konvertuju u celobrojne brojčane vrednosti. Takođe se definiše vektor koji predstavlja numeričke kolone.
+
+```{r}
+convert_to_integer <- function(df, cols) {
+    for (col in cols) {
+      # Convert column values to numeric and then to integer
+      df <- df %>%
+        mutate(!!sym(col) := as.integer(!!sym(col)))
+    }
+    return(df)
+  }  
+to_numeric_cols <- c("NUMBER_OF_PERSONS_INJURED",
+                    "NUMBER_OF_CYCLIST_KILLED",
+                    "NUMBER_OF_MOTORIST_INJURED")
+
+collisions <- convert_to_integer(collisions, to_numeric_cols)
+
+
+cols_of_interest <- c("LATITUDE", "LONGITUDE", "NUMBER_OF_PERSONS_INJURED",
+                        "NUMBER_OF_PERSONS_KILLED", "NUMBER_OF_PEDESTRIANS_INJURED",
+                        "NUMBER_OF_PEDESTRIANS_KILLED", "NUMBER_OF_CYCLIST_INJURED",
+                        "NUMBER_OF_CYCLIST_KILLED", "NUMBER_OF_MOTORIST_INJURED",
+                        "NUMBER_OF_MOTORIST_KILLED")
+
+```
+
+Računaju se deskriptivne statistike za svako numeričko obeležje.
+
+```{r eval=T, results='hold'}
+for (col in cols_of_interest) {
+  column_values <- collisions %>% pull(col)
+
+  if (is.numeric(column_values)) {
+    # Compute summary statistics
+    count <- length(column_values)
+    min_val <- min(column_values, na.rm = TRUE)
+    quantile_25 <- quantile(column_values, probs = 0.25, na.rm = TRUE)
+    median_val <- median(column_values, na.rm = TRUE)
+    mean_val <- mean(column_values, na.rm = TRUE)
+    std_val <- sd(column_values, na.rm = TRUE)
+    quantile_75 <- quantile(column_values, probs = 0.75, na.rm = TRUE)
+    max_val <- max(column_values, na.rm = TRUE)
+
+    # Print the summary statistics
+    cat("Summary statistics for column:", col, "\n")
+    cat("count: ", count, "\n")
+    cat("mean: ", mean_val, "\n")
+    cat("std: ", std_val, "\n")
+    cat("min: ", min_val, "\n")
+    cat("25%: ", quantile_25, "\n")
+    cat("50%: ", median_val, "\n")
+    cat("75%: ", quantile_75, "\n")
+    cat("max: ", max_val, "\n\n")
+  } else {
+    cat("Column", col, "contains non-numeric values. Skipping...\n\n")
+        }
+}
+```
+
+## Dodatno uređivanje skupa podataka
+
+Kako je nakon prikaza statistika primećeno da neke kolone imaju veliki broj neodređenih vrednosti, posmatra se % takvih vrednosti.
+
+Izračunavanje procenta vrednosti "Unspecified" za kolone koje se odnose na faktore koji su doprineli sudaru, iz ugla različitih vozila koji su učestvovali.
+
+```{r eval=T, results='hold'}
+  unspecified_percentage <- collisions %>%
+    filter(CONTRIBUTING_FACTOR_VEHICLE_1 == "Unspecified") %>%
+    sdf_nrow() / sdf_nrow(collisions) * 100
+  print(paste("Procentualni udeo vrednosti 'Unspecified' za kolonu 'CONTRIBUTING_FACTOR_VEHICLE_2':", unspecified_percentage, "%"))
+  
+  unspecified_percentage <- collisions %>%
+    filter(CONTRIBUTING_FACTOR_VEHICLE_2 == "Unspecified") %>%
+    sdf_nrow() / sdf_nrow(collisions) * 100
+  print(paste("Procentualni udeo vrednosti 'Unspecified' za kolonu 'CONTRIBUTING_FACTOR_VEHICLE_3':", unspecified_percentage, "%"))
+  
+  unspecified_percentage <- collisions %>%
+    filter(CONTRIBUTING_FACTOR_VEHICLE_3 == "Unspecified") %>%
+    sdf_nrow() / sdf_nrow(collisions) * 100
+  print(paste("Procentualni udeo vrednosti 'Unspecified' za kolonu 'CONTRIBUTING_FACTOR_VEHICLE_4':", unspecified_percentage, "%"))
+  
+  unspecified_percentage <- collisions %>%
+    filter(CONTRIBUTING_FACTOR_VEHICLE_4 == "Unspecified") %>%
+    sdf_nrow() / sdf_nrow(collisions) * 100
+  print(paste("Procentualni udeo vrednosti 'Unspecified' za kolonu 'CONTRIBUTING_FACTOR_VEHICLE_4':", unspecified_percentage, "%"))
+  
+  unspecified_percentage <- collisions %>%
+    filter(CONTRIBUTING_FACTOR_VEHICLE_5 == "Unspecified") %>%
+    sdf_nrow() / sdf_nrow(collisions) * 100
+  print(paste("Procentualni udeo vrednosti 'Unspecified' za kolonu 'CONTRIBUTING_FACTOR_VEHICLE_5':", unspecified_percentage, "%"))
+
+  
+  cols_to_drop <- c("CONTRIBUTING_FACTOR_VEHICLE_5","CONTRIBUTING_FACTOR_VEHICLE_4","CONTRIBUTING_FACTOR_VEHICLE_3","CONTRIBUTING_FACTOR_VEHICLE_2" )
+  collisions <- collisions %>% 
+    select(-any_of(cols_to_drop))
+```
+
+S obzirom na veliko prisustvo 'Unspecified' vrednosti odabrane kolone ne doprinose novim informacijama o sudarima, te se mogu izbaciti.
+
+Izračunavanje procenta vrednosti "UNKNOWN" za kolone koje se odnose na tip vozila.
+```{r eval=T, results='hold'}
+  unknown_percentage_1 <- collisions %>%
+    filter(VEHICLE_TYPE_CODE_1 == "UNKNOWN") %>%
+    sdf_nrow() / sdf_nrow(collisions) * 100
+  print(paste("Percentage of 'UNKNOWN' value for column 'VEHICLE_TYPE_CODE_1':", unknown_percentage_1, "%"))
+  
+  unknown_percentage_2 <- collisions %>%
+    filter(VEHICLE_TYPE_CODE_2 == "UNKNOWN") %>%
+    sdf_nrow() / sdf_nrow(collisions) * 100
+  print(paste("Percentage of 'UNKNOWN' value for column 'VEHICLE_TYPE_CODE_2':", unknown_percentage_2, "%"))
+  
+  unknown_percentage_3 <- collisions %>%
+    filter(VEHICLE_TYPE_CODE_3 == "UNKNOWN") %>%
+    sdf_nrow() / sdf_nrow(collisions) * 100
+  print(paste("Percentage of 'UNKNOWN' value for column 'VEHICLE_TYPE_CODE_3':", unknown_percentage_3, "%"))
+  
+  unknown_percentage_4 <- collisions %>%
+    filter(VEHICLE_TYPE_CODE_4 == "UNKNOWN") %>%
+    sdf_nrow() / sdf_nrow(collisions) * 100
+  print(paste("Percentage of 'UNKNOWN' value for column 'VEHICLE_TYPE_CODE_4':", unknown_percentage_4, "%"))
+  
+  unknown_percentage_5 <- collisions %>%
+    filter(VEHICLE_TYPE_CODE_5 == "UNKNOWN") %>%
+    sdf_nrow() / sdf_nrow(collisions) * 100
+  print(paste("Percentage of 'UNKNOWN' value for column 'VEHICLE_TYPE_CODE_5':", unknown_percentage_5, "%"))
+
+  cols_to_drop <- c("VEHICLE_TYPE_CODE_5","VEHICLE_TYPE_CODE_4","VEHICLE_TYPE_CODE_3","VEHICLE_TYPE_CODE_2" )
+  collisions <- collisions %>% 
+    select(-any_of(cols_to_drop))
+```
+
+S obzirom na veliko prisustvo 'UNKNOWN' vrednosti odabrane kolone ne doprinose novim informacijama o sudarima, te se mogu izbaciti.
+
+Izračunavanje procenta vrednosti "Not provided" ili "" za kolonu 'OFF_STREET_NAME'.
+```{r eval=T, results='hold'}
+  unspecified_percentage <- collisions %>%
+    filter(OFF_STREET_NAME == "Not provided"|| OFF_STREET_NAME == "") %>%
+    sdf_nrow() / sdf_nrow(collisions) * 100
+  print(paste("Procentualni udeo vrednosti 'Unspecified' za kolonu 'OFF_STREET_NAME':", unspecified_percentage, "%"))
+  
+  # S obzirom na veliko prisustvo 'Not provided' ili praznih vrednosti kolona 'OFF_STREET_NAME' ne doprinosi novim informacijama o sudarima, te se može izbaciti.
+  collisions <- collisions %>% 
+    select(-OFF_STREET_NAME)
+```
